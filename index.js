@@ -1,86 +1,72 @@
-const { default: makeWASocket, useMultiFileAuthState, delay } = require("@whiskeysockets/baileys")
-const P = require("pino")
+const { default: makeWASocket, useSingleFileAuthState } = require("@whiskeysockets/baileys")
 const fs = require("fs")
+const P = require("pino")
 
-const config = require("./config.json")
+const { state, saveState } = useSingleFileAuthState("./session.json")
 
 let cooldown = {}
 
 async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState("session")
-
     const sock = makeWASocket({
         logger: P({ level: "silent" }),
-        auth: state
+        auth: state,
+        printQRInTerminal: true
     })
 
-    sock.ev.on("creds.update", saveCreds)
+    sock.ev.on("creds.update", saveState)
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
-        let msg = messages[0]
+        const msg = messages[0]
         if (!msg.message) return
 
-        let sender = msg.key.remoteJid
+        const sender = msg.key.remoteJid
 
-        // cooldown anti spam
+        const text =
+            msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            ""
+
         if (cooldown[sender]) return
         cooldown[sender] = true
-
-        setTimeout(() => {
-            delete cooldown[sender]
-        }, 15000) // 15 detik
-
-        // typing simulation
-        await sock.sendPresenceUpdate("composing", sender)
-
-        // delay random 5-10 detik
-        let randomDelay = Math.floor(Math.random() * 5000) + 5000
-        await delay(randomDelay)
-
-        // menu otomatis
-        let text = `
-Halo 👋
-
-Silakan pilih promo:
-
-1️⃣ Paling Murah  
-2️⃣ Tebus Heboh  
-3️⃣ Beli Banyak Lebih Hemat  
-
-Ketik angka 1 / 2 / 3
-`
-
-        await sock.sendMessage(sender, { text })
-    })
-
-    sock.ev.on("messages.upsert", async ({ messages }) => {
-        let msg = messages[0]
-        if (!msg.message?.conversation) return
-
-        let text = msg.message.conversation
-        let sender = msg.key.remoteJid
+        setTimeout(() => delete cooldown[sender], 15000)
 
         await sock.sendPresenceUpdate("composing", sender)
-        await delay(3000)
+
+        const delayTime = Math.floor(Math.random() * 5000) + 5000
+        await new Promise(r => setTimeout(r, delayTime))
+
+        if (text !== "1" && text !== "2" && text !== "3") {
+            await sock.sendMessage(sender, {
+                text: `Halo 👋
+
+Pilih promo:
+
+1. Paling Murah
+2. Tebus Heboh
+3. Beli Banyak Lebih Hemat
+
+Ketik 1 / 2 / 3`
+            })
+        }
 
         if (text === "1") {
             await sock.sendMessage(sender, {
                 image: fs.readFileSync("./images/murah.jpg"),
-                caption: "🔥 Promo Paling Murah"
+                caption: "Promo Paling Murah"
             })
         }
 
         if (text === "2") {
             await sock.sendMessage(sender, {
                 image: fs.readFileSync("./images/tebus.jpg"),
-                caption: "🎉 Tebus Heboh"
+                caption: "Tebus Heboh"
             })
         }
 
         if (text === "3") {
             await sock.sendMessage(sender, {
                 image: fs.readFileSync("./images/hemat.jpg"),
-                caption: "💰 Beli Banyak Lebih Hemat"
+                caption: "Beli Banyak Lebih Hemat"
             })
         }
     })
