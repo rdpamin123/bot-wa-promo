@@ -1,0 +1,10 @@
+{
+"name": "bot-wa-promo",
+"version": "1.0.0",
+"main": "bot.js",
+"dependencies": {
+"@whiskeysockets/baileys": "^6.6.0",
+"axios": "^1.6.0",
+"pino": "^8.0.0"
+}
+}
