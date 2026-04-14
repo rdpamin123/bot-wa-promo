@@ -1,0 +1,14 @@
+{
+  "name": "wa-promo-bot",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp promo gratis dengan 4 kategori gambar",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.7",
+    "pino": "^9.4.0"
+  },
+  "type": "module"
+}
