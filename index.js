@@ -1,183 +1,256 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  makeInMemoryStore,
-  delay,
-  fetchLatestBaileysVersion,
-  Browsers
-} from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
-import pino from 'pino';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+const {
+    makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    proto,
+    generateWAMessageFromContent,
+    Browsers
+} = require('@whiskeysockets/baileys');
+const fs = require('fs-extra');
+const path = require('path');
+const readline = require('readline');
+const config = require('./config');
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// ==================== HELPER FUNCTIONS ====================
+const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Konfigurasi logger (bisa dimatikan jika terlalu banyak log)
-const logger = pino({ level: 'silent' });
+// Cooldown user
+const userCooldowns = new Map();
 
-// Folder session
-const AUTH_FOLDER = './auth_info_baileys';
-
-// Folder gambar
-const IMAGE_DIR = path.join(__dirname, 'images');
-const imageMap = {
-  '1': 'murah.jpg',
-  '2': 'tebus.jpg',
-  '3': 'hemat.jpg',
-  '4': 'banyak.jpg'
+// Dapatkan gambar random dari folder
+const getRandomImageFromFolder = (folderPath) => {
+    try {
+        if (!fs.existsSync(folderPath)) return null;
+        const files = fs.readdirSync(folderPath).filter(file => {
+            const ext = path.extname(file).toLowerCase();
+            return ['.jpg', '.jpeg', '.png'].includes(ext);
+        });
+        if (files.length === 0) return null;
+        const randomFile = files[Math.floor(Math.random() * files.length)];
+        return path.join(folderPath, randomFile);
+    } catch (err) {
+        console.error('Error membaca folder:', err);
+        return null;
+    }
 };
 
-// Delay acak antara 0.5 - 2.5 detik (dalam milidetik)
-function randomDelay() {
-  return Math.floor(Math.random() * 2000) + 500;
-}
+// Input dari terminal
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+});
+const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
-// Fungsi untuk mengirim pesan dengan efek mengetik dan delay
-async function sendWithTyping(sock, jid, content, options = {}) {
-  await sock.presenceSubscribe(jid);
-  await delay(500);
-  await sock.sendPresenceUpdate('composing', jid);
-  await delay(randomDelay());
-  await sock.sendPresenceUpdate('paused', jid);
-  
-  if (typeof content === 'string') {
-    return await sock.sendMessage(jid, { text: content }, options);
-  } else {
-    // content berupa object Message (misal image)
-    return await sock.sendMessage(jid, content, options);
-  }
-}
+// Kirim pesan tombol interaktif (4 pilihan)
+const sendInteractiveButtons = async (sock, jid, text, buttons) => {
+    const msg = generateWAMessageFromContent(jid, {
+        viewOnceMessage: {
+            message: {
+                interactiveMessage: {
+                    body: { text },
+                    nativeFlowMessage: {
+                        buttons: buttons.map((btn, index) => ({
+                            name: "quick_reply",
+                            buttonParamsJson: JSON.stringify({
+                                display_text: btn.displayText,
+                                id: btn.id
+                            })
+                        }))
+                    }
+                }
+            }
+        }
+    }, {});
+    await sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
+};
 
-// Fungsi utama
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-  const { version, isLatest } = await fetchLatestBaileysVersion();
-  
-  const sock = makeWASocket({
-    version,
-    logger,
-    printQRInTerminal: false,
-    auth: state,
-    browser: Browsers.ubuntu('Chrome'),
-    markOnlineOnConnect: true,
-    generateHighQualityLinkPreview: true
-  });
-
-  // Simpan kredensial saat diperbarui
-  sock.ev.on('creds.update', saveCreds);
-
-  // Event saat koneksi terhubung
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+// ==================== FUNGSI LOGIN DENGAN PAIRING CODE ====================
+const startBot = async () => {
+    const { state, saveCreds } = await useMultiFileAuthState(config.sessionName);
     
-    if (qr) {
-      console.log('Scan QR Code ini di WhatsApp Web:');
-      console.log(qr);
+    // Minta nomor HP jika belum ada di config
+    let phoneNumber = config.botNumber;
+    if (!phoneNumber) {
+        console.log('\n📱 Masukkan nomor WhatsApp untuk bot:');
+        console.log('   (Format internasional tanpa +, contoh: 6281234567890)');
+        phoneNumber = await question('   Nomor: ');
     }
     
-    if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Koneksi terputus, mencoba reconnect...', shouldReconnect);
-      if (shouldReconnect) {
-        startBot();
-      } else {
-        console.log('Logout. Hapus folder auth_info_baileys untuk login ulang.');
-      }
-    } else if (connection === 'open') {
-      console.log('✅ Bot WhatsApp siap! Nomor:', sock.user.id.split(':')[0]);
-    }
-  });
-
-  // Event menerima pesan
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0];
-    if (!msg.message) return;
-    if (msg.key.fromMe) return; // abaikan pesan sendiri
+    // Bersihkan nomor
+    phoneNumber = phoneNumber.replace(/[^0-9]/g, '');
     
-    const from = msg.key.remoteJid;
-    const messageType = Object.keys(msg.message)[0];
-    
-    // Hanya proses pesan teks (conversation atau extendedText)
-    let text = '';
-    if (messageType === 'conversation') {
-      text = msg.message.conversation;
-    } else if (messageType === 'extendedTextMessage') {
-      text = msg.message.extendedTextMessage.text;
-    } else {
-      return;
-    }
-    
-    // Kirim balasan dengan menu 4 kategori (apapun teksnya)
-    const menuText = `👋 Halo! Silakan pilih kategori promo kami:\n\n` +
-                     `1️⃣ *Paling Murah*\n` +
-                     `2️⃣ *Tebus Heboh*\n` +
-                     `3️⃣ *Hemat Minggu Ini*\n` +
-                     `4️⃣ *Beli Banyak*\n\n` +
-                     `Balas dengan angka 1, 2, 3, atau 4 ya.`;
-    
-    await sendWithTyping(sock, from, menuText);
-  });
-
-  // Event saat ada balasan (reply) dari user yang memilih angka
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0];
-    if (!msg.message) return;
-    if (msg.key.fromMe) return;
-    
-    const from = msg.key.remoteJid;
-    const messageType = Object.keys(msg.message)[0];
-    let text = '';
-    if (messageType === 'conversation') {
-      text = msg.message.conversation;
-    } else if (messageType === 'extendedTextMessage') {
-      text = msg.message.extendedTextMessage.text;
-    } else {
-      return;
-    }
-    
-    // Cek apakah pesan adalah pilihan angka 1-4
-    const choice = text.trim();
-    if (!['1','2','3','4'].includes(choice)) return;
-    
-    const imageFile = imageMap[choice];
-    if (!imageFile) return;
-    
-    const imagePath = path.join(IMAGE_DIR, imageFile);
-    
-    // Cek apakah file gambar ada
-    if (!fs.existsSync(imagePath)) {
-      await sendWithTyping(sock, from, '❌ Maaf, gambar untuk kategori ini belum tersedia.');
-      return;
-    }
-    
-    // Kirim gambar dengan caption singkat
-    const captionMap = {
-      '1': '🛒 *Paling Murah* - Harga spesial hanya untuk kamu!',
-      '2': '🔥 *Tebus Heboh* - Diskon gila-gilaan!',
-      '3': '📅 *Hemat Minggu Ini* - Promo mingguan terbatas.',
-      '4': '📦 *Beli Banyak* - Makin banyak makin hemat!'
-    };
-    
-    const imageBuffer = fs.readFileSync(imagePath);
-    
-    // Kirim efek mengetik
-    await sock.presenceSubscribe(from);
-    await delay(500);
-    await sock.sendPresenceUpdate('composing', from);
-    await delay(randomDelay());
-    await sock.sendPresenceUpdate('paused', from);
-    
-    // Kirim gambar
-    await sock.sendMessage(from, {
-      image: imageBuffer,
-      caption: captionMap[choice],
-      mimetype: 'image/jpeg'
+    const sock = makeWASocket({
+        auth: state,
+        browser: Browsers.ubuntu('Termux Bot'),
+        printQRInTerminal: false, // Tidak perlu QR
+        mobile: true, // Gunakan mobile API untuk pairing code
+        markOnlineOnConnect: true,
     });
-  });
-}
+
+    // Minta pairing code
+    if (!sock.authState.creds.registered) {
+        console.log('\n🔐 Meminta kode pairing...');
+        const code = await sock.requestPairingCode(phoneNumber);
+        console.log('\n✅ Kode pairing Anda: *' + code + '*');
+        console.log('📲 Buka WhatsApp di HP Anda, lalu:');
+        console.log('   1. Buka menu "Perangkat Tertaut"');
+        console.log('   2. Ketuk "Tautkan Perangkat"');
+        console.log('   3. Pilih "Tautkan dengan nomor telepon"');
+        console.log('   4. Masukkan kode 8 digit di atas\n');
+        console.log('⏳ Menunggu konfirmasi...\n');
+    }
+
+    // Handle event connection update
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
+        
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('⚠️ Koneksi terputus, mencoba reconnect...', shouldReconnect);
+            if (shouldReconnect) {
+                startBot();
+            } else {
+                console.log('❌ Logout terdeteksi. Hapus folder auth_info_baileys untuk login ulang.');
+                process.exit(1);
+            }
+        } else if (connection === 'open') {
+            console.log('\n🎉 *Bot berhasil terhubung!*');
+            console.log('   Nomor aktif:', sock.user.id.split(':')[0]);
+            console.log('   Bot siap menerima chat.\n');
+        }
+    });
+
+    // Simpan kredensial saat update
+    sock.ev.on('creds.update', saveCreds);
+
+    // ==================== HANDLE PESAN MASUK ====================
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+        
+        const sender = msg.key.remoteJid;
+        const isGroup = sender.endsWith('@g.us');
+        if (isGroup) return; // Bot hanya respon chat pribadi
+        
+        const messageContent = msg.message;
+        const textMessage = messageContent.conversation || 
+                           messageContent.extendedTextMessage?.text || 
+                           messageContent.imageMessage?.caption || '';
+        
+        // Cek cooldown user
+        const now = Date.now();
+        const cooldownEnd = userCooldowns.get(sender);
+        if (cooldownEnd && now < cooldownEnd) {
+            const remaining = Math.ceil((cooldownEnd - now) / 1000);
+            console.log(`User ${sender} dalam cooldown ${remaining} detik`);
+            return;
+        }
+
+        // Cek apakah pesan adalah respons dari tombol (interactive)
+        const buttonResponse = messageContent.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+        let selectedOption = null;
+        if (buttonResponse) {
+            try {
+                const parsed = JSON.parse(buttonResponse);
+                selectedOption = parsed.id;
+            } catch (e) {}
+        }
+
+        // Set cooldown user
+        userCooldowns.set(sender, now + config.userCooldown * 1000);
+        setTimeout(() => userCooldowns.delete(sender), config.userCooldown * 1000);
+
+        // Proses perintah
+        if (selectedOption) {
+            await handleCategorySelection(sock, sender, selectedOption);
+        } else if (textMessage.toLowerCase().includes('menu') || !selectedOption) {
+            await sendMainMenu(sock, sender);
+        }
+    });
+
+    // ==================== KIRIM MENU UTAMA ====================
+    const sendMainMenu = async (sock, jid) => {
+        // Delay sebelum reply
+        await sleep(randomDelay(config.replyDelay.min, config.replyDelay.max));
+        
+        // Typing effect
+        await sock.sendPresenceUpdate('composing', jid);
+        await sleep(randomDelay(config.typingDelay.min, config.typingDelay.max));
+        
+        // Buttons
+        const buttons = [
+            { displayText: '🔥 Paling Murah', id: 'paling_murah' },
+            { displayText: '⚡ Tebus Heboh', id: 'tebus_heboh' },
+            { displayText: '📅 Hemat Minggu Ini', id: 'hemat_minggu_ini' },
+            { displayText: '🛒 Beli Banyak', id: 'beli_banyak' }
+        ];
+        
+        await sendInteractiveButtons(sock, jid, config.menuText, buttons);
+        await sock.sendPresenceUpdate('paused', jid);
+    };
+
+    // ==================== HANDLE PILIHAN KATEGORI ====================
+    const handleCategorySelection = async (sock, jid, categoryId) => {
+        const categoryKey = categoryId;
+        const folderPath = config.imagePaths[categoryKey];
+        
+        if (!folderPath) {
+            await sock.sendMessage(jid, { text: '❌ Kategori tidak valid.' });
+            return;
+        }
+
+        // Typing
+        await sock.sendPresenceUpdate('composing', jid);
+        await sleep(randomDelay(1500, 2500));
+        
+        // Cari gambar random
+        const imagePath = getRandomImageFromFolder(folderPath);
+        if (!imagePath) {
+            await sock.sendMessage(jid, { text: `⚠️ Maaf, gambar untuk kategori ${categoryKey.replace(/_/g, ' ')} belum tersedia.` });
+            await sock.sendPresenceUpdate('paused', jid);
+            // Tanya lagi
+            await sleep(1000);
+            await askForMore(sock, jid);
+            return;
+        }
+
+        // Kirim gambar dengan caption
+        const caption = config.imageCaption[categoryKey] || 'Promo spesial!';
+        const imageBuffer = await fs.readFile(imagePath);
+        
+        await sock.sendMessage(jid, {
+            image: imageBuffer,
+            caption: caption,
+            mimetype: 'image/jpeg'
+        });
+        
+        await sock.sendPresenceUpdate('paused', jid);
+        
+        // Delay sebentar lalu tanya lagi
+        await sleep(2000);
+        await askForMore(sock, jid);
+    };
+
+    // ==================== TANYA LAGI SETELAH KIRIM GAMBAR ====================
+    const askForMore = async (sock, jid) => {
+        // Kirim pesan teks tanya dulu
+        await sock.sendPresenceUpdate('composing', jid);
+        await sleep(1500);
+        await sock.sendMessage(jid, { text: config.askAgainText });
+        await sock.sendPresenceUpdate('paused', jid);
+        
+        // Kirim ulang menu tombol
+        await sleep(1000);
+        await sendMainMenu(sock, jid);
+    };
+
+    // ==================== CLEANUP ====================
+    rl.on('close', () => {
+        console.log('Bot dimatikan.');
+        process.exit(0);
+    });
+};
 
 // Jalankan bot
 startBot().catch(err => console.error('Error:', err));
