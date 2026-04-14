@@ -17,10 +17,10 @@ module.exports = {
     
     // Path folder gambar
     imagePaths: {
-        'paling_murah': './images/murah.jpg',
-        'tebus_heboh': './images/heboh.jpg',
-        'hemat_minggu_ini': './images/hemat.jpg',
-        'beli_banyak': './images/banyak.jpg'
+        'paling_murah': './images/paling-murah',
+        'tebus_heboh': './images/tebus-heboh',
+        'hemat_minggu_ini': './images/hemat-minggu-ini',
+        'beli_banyak': './images/beli-banyak'
     },
     
     // Teks menu utama
