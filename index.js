@@ -3,7 +3,8 @@ const {
     useMultiFileAuthState,
     DisconnectReason,
     generateWAMessageFromContent,
-    Browsers
+    Browsers,
+    fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 const fs = require('fs-extra');
 const path = require('path');
@@ -49,7 +50,7 @@ const sendInteractiveButtons = async (sock, jid, text, buttons) => {
                 interactiveMessage: {
                     body: { text },
                     nativeFlowMessage: {
-                        buttons: buttons.map((btn, index) => ({
+                        buttons: buttons.map((btn) => ({
                             name: "quick_reply",
                             buttonParamsJson: JSON.stringify({
                                 display_text: btn.displayText,
@@ -68,6 +69,9 @@ const sendInteractiveButtons = async (sock, jid, text, buttons) => {
 const startBot = async () => {
     const { state, saveCreds } = await useMultiFileAuthState(config.sessionName);
     
+    // Ambil versi terbaru Baileys (opsional)
+    const { version } = await fetchLatestBaileysVersion();
+    
     // Minta nomor HP jika belum ada di config
     let phoneNumber = config.botNumber;
     if (!phoneNumber) {
@@ -80,28 +84,56 @@ const startBot = async () => {
     phoneNumber = phoneNumber.replace(/[^0-9]/g, '');
     
     const sock = makeWASocket({
+        version,
         auth: state,
         browser: Browsers.ubuntu('Termux Bot'),
-        printQRInTerminal: false,
-        mobile: true,
+        printQRInTerminal: false, // Kita pakai pairing code dulu
         markOnlineOnConnect: true,
     });
 
-    // Minta pairing code
+    // Minta pairing code jika belum terdaftar
     if (!sock.authState.creds.registered) {
         console.log('\n🔐 Meminta kode pairing...');
-        const code = await sock.requestPairingCode(phoneNumber);
-        console.log('\n✅ Kode pairing Anda: *' + code + '*');
-        console.log('📲 Buka WhatsApp di HP Anda, lalu:');
-        console.log('   1. Buka menu "Perangkat Tertaut"');
-        console.log('   2. Ketuk "Tautkan Perangkat"');
-        console.log('   3. Pilih "Tautkan dengan nomor telepon"');
-        console.log('   4. Masukkan kode 8 digit di atas\n');
-        console.log('⏳ Menunggu konfirmasi...\n');
+        try {
+            const code = await sock.requestPairingCode(phoneNumber);
+            console.log('\n✅ Kode pairing Anda: *' + code + '*');
+            console.log('📲 Buka WhatsApp di HP Anda, lalu:');
+            console.log('   1. Buka menu "Perangkat Tertaut"');
+            console.log('   2. Ketuk "Tautkan Perangkat"');
+            console.log('   3. Pilih "Tautkan dengan nomor telepon"');
+            console.log('   4. Masukkan kode 8 digit di atas\n');
+            console.log('⏳ Menunggu konfirmasi...\n');
+        } catch (err) {
+            console.log('⚠️ Gagal meminta kode pairing, menggunakan QR code sebagai fallback.');
+            console.log('   Scan QR code yang muncul di bawah:\n');
+            sock.ev.off('connection.update'); // Matikan listener sementara agar QR bisa tampil
+            // Recreate socket dengan QR enabled
+            const sockQR = makeWASocket({
+                version,
+                auth: state,
+                browser: Browsers.ubuntu('Termux Bot'),
+                printQRInTerminal: true,
+                markOnlineOnConnect: true,
+            });
+            // Tunggu koneksi
+            sockQR.ev.on('connection.update', (update) => {
+                const { connection, qr } = update;
+                if (qr) {
+                    require('qrcode-terminal').generate(qr, { small: true });
+                }
+                if (connection === 'open') {
+                    console.log('\n🎉 Bot berhasil terhubung via QR!');
+                    // Lanjutkan dengan socket QR
+                    setupMessageHandlers(sockQR);
+                }
+            });
+            sockQR.ev.on('creds.update', saveCreds);
+            return; // Hentikan eksekusi lebih lanjut di fungsi ini
+        }
     }
 
     // Handle event connection update
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
@@ -117,13 +149,15 @@ const startBot = async () => {
             console.log('\n🎉 *Bot berhasil terhubung!*');
             console.log('   Nomor aktif:', sock.user.id.split(':')[0]);
             console.log('   Bot siap menerima chat.\n');
+            setupMessageHandlers(sock);
         }
     });
 
-    // Simpan kredensial saat update
     sock.ev.on('creds.update', saveCreds);
+};
 
-    // ==================== HANDLE PESAN MASUK ====================
+// ==================== SETUP MESSAGE HANDLER ====================
+function setupMessageHandlers(sock) {
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
@@ -144,7 +178,7 @@ const startBot = async () => {
             return;
         }
 
-        // Cek tombol
+        // Cek tombol interaktif
         const buttonResponse = messageContent.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
         let selectedOption = null;
         if (buttonResponse) {
@@ -163,69 +197,66 @@ const startBot = async () => {
             await sendMainMenu(sock, sender);
         }
     });
+}
 
-    const sendMainMenu = async (sock, jid) => {
-        await sleep(randomDelay(config.replyDelay.min, config.replyDelay.max));
-        await sock.sendPresenceUpdate('composing', jid);
-        await sleep(randomDelay(config.typingDelay.min, config.typingDelay.max));
-        
-        const buttons = [
-            { displayText: '🔥 Paling Murah', id: 'paling_murah' },
-            { displayText: '⚡ Tebus Heboh', id: 'tebus_heboh' },
-            { displayText: '📅 Hemat Minggu Ini', id: 'hemat_minggu_ini' },
-            { displayText: '🛒 Beli Banyak', id: 'beli_banyak' }
-        ];
-        
-        await sendInteractiveButtons(sock, jid, config.menuText, buttons);
-        await sock.sendPresenceUpdate('paused', jid);
-    };
-
-    const handleCategorySelection = async (sock, jid, categoryId) => {
-        const folderPath = config.imagePaths[categoryId];
-        if (!folderPath) {
-            await sock.sendMessage(jid, { text: '❌ Kategori tidak valid.' });
-            return;
-        }
-
-        await sock.sendPresenceUpdate('composing', jid);
-        await sleep(randomDelay(1500, 2500));
-        
-        const imagePath = getRandomImageFromFolder(folderPath);
-        if (!imagePath) {
-            await sock.sendMessage(jid, { text: `⚠️ Maaf, gambar untuk kategori ${categoryId.replace(/_/g, ' ')} belum tersedia.` });
-            await sock.sendPresenceUpdate('paused', jid);
-            await sleep(1000);
-            await askForMore(sock, jid);
-            return;
-        }
-
-        const caption = config.imageCaption[categoryId] || 'Promo spesial!';
-        const imageBuffer = await fs.readFile(imagePath);
-        
-        await sock.sendMessage(jid, {
-            image: imageBuffer,
-            caption: caption,
-            mimetype: 'image/jpeg'
-        });
-        
-        await sock.sendPresenceUpdate('paused', jid);
-        await sleep(2000);
-        await askForMore(sock, jid);
-    };
-
-    const askForMore = async (sock, jid) => {
-        await sock.sendPresenceUpdate('composing', jid);
-        await sleep(1500);
-        await sock.sendMessage(jid, { text: config.askAgainText });
-        await sock.sendPresenceUpdate('paused', jid);
-        await sleep(1000);
-        await sendMainMenu(sock, jid);
-    };
-
-    rl.on('close', () => {
-        console.log('Bot dimatikan.');
-        process.exit(0);
-    });
+// ==================== MENU & KATEGORI ====================
+const sendMainMenu = async (sock, jid) => {
+    await sleep(randomDelay(config.replyDelay.min, config.replyDelay.max));
+    await sock.sendPresenceUpdate('composing', jid);
+    await sleep(randomDelay(config.typingDelay.min, config.typingDelay.max));
+    
+    const buttons = [
+        { displayText: '🔥 Paling Murah', id: 'paling_murah' },
+        { displayText: '⚡ Tebus Heboh', id: 'tebus_heboh' },
+        { displayText: '📅 Hemat Minggu Ini', id: 'hemat_minggu_ini' },
+        { displayText: '🛒 Beli Banyak', id: 'beli_banyak' }
+    ];
+    
+    await sendInteractiveButtons(sock, jid, config.menuText, buttons);
+    await sock.sendPresenceUpdate('paused', jid);
 };
 
+const handleCategorySelection = async (sock, jid, categoryId) => {
+    const folderPath = config.imagePaths[categoryId];
+    if (!folderPath) {
+        await sock.sendMessage(jid, { text: '❌ Kategori tidak valid.' });
+        return;
+    }
+
+    await sock.sendPresenceUpdate('composing', jid);
+    await sleep(randomDelay(1500, 2500));
+    
+    const imagePath = getRandomImageFromFolder(folderPath);
+    if (!imagePath) {
+        await sock.sendMessage(jid, { text: `⚠️ Maaf, gambar untuk kategori ${categoryId.replace(/_/g, ' ')} belum tersedia.` });
+        await sock.sendPresenceUpdate('paused', jid);
+        await sleep(1000);
+        await askForMore(sock, jid);
+        return;
+    }
+
+    const caption = config.imageCaption[categoryId] || 'Promo spesial!';
+    const imageBuffer = await fs.readFile(imagePath);
+    
+    await sock.sendMessage(jid, {
+        image: imageBuffer,
+        caption: caption,
+        mimetype: 'image/jpeg'
+    });
+    
+    await sock.sendPresenceUpdate('paused', jid);
+    await sleep(2000);
+    await askForMore(sock, jid);
+};
+
+const askForMore = async (sock, jid) => {
+    await sock.sendPresenceUpdate('composing', jid);
+    await sleep(1500);
+    await sock.sendMessage(jid, { text: config.askAgainText });
+    await sock.sendPresenceUpdate('paused', jid);
+    await sleep(1000);
+    await sendMainMenu(sock, jid);
+};
+
+// ==================== START BOT ====================
 startBot().catch(err => console.error('Error:', err));
