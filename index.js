@@ -2,7 +2,6 @@ const {
     makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
-    proto,
     generateWAMessageFromContent,
     Browsers
 } = require('@whiskeysockets/baileys');
@@ -83,8 +82,8 @@ const startBot = async () => {
     const sock = makeWASocket({
         auth: state,
         browser: Browsers.ubuntu('Termux Bot'),
-        printQRInTerminal: false, // Tidak perlu QR
-        mobile: true, // Gunakan mobile API untuk pairing code
+        printQRInTerminal: false,
+        mobile: true,
         markOnlineOnConnect: true,
     });
 
@@ -131,7 +130,7 @@ const startBot = async () => {
         
         const sender = msg.key.remoteJid;
         const isGroup = sender.endsWith('@g.us');
-        if (isGroup) return; // Bot hanya respon chat pribadi
+        if (isGroup) return;
         
         const messageContent = msg.message;
         const textMessage = messageContent.conversation || 
@@ -142,12 +141,10 @@ const startBot = async () => {
         const now = Date.now();
         const cooldownEnd = userCooldowns.get(sender);
         if (cooldownEnd && now < cooldownEnd) {
-            const remaining = Math.ceil((cooldownEnd - now) / 1000);
-            console.log(`User ${sender} dalam cooldown ${remaining} detik`);
             return;
         }
 
-        // Cek apakah pesan adalah respons dari tombol (interactive)
+        // Cek tombol
         const buttonResponse = messageContent.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
         let selectedOption = null;
         if (buttonResponse) {
@@ -157,28 +154,21 @@ const startBot = async () => {
             } catch (e) {}
         }
 
-        // Set cooldown user
         userCooldowns.set(sender, now + config.userCooldown * 1000);
         setTimeout(() => userCooldowns.delete(sender), config.userCooldown * 1000);
 
-        // Proses perintah
         if (selectedOption) {
             await handleCategorySelection(sock, sender, selectedOption);
-        } else if (textMessage.toLowerCase().includes('menu') || !selectedOption) {
+        } else {
             await sendMainMenu(sock, sender);
         }
     });
 
-    // ==================== KIRIM MENU UTAMA ====================
     const sendMainMenu = async (sock, jid) => {
-        // Delay sebelum reply
         await sleep(randomDelay(config.replyDelay.min, config.replyDelay.max));
-        
-        // Typing effect
         await sock.sendPresenceUpdate('composing', jid);
         await sleep(randomDelay(config.typingDelay.min, config.typingDelay.max));
         
-        // Buttons
         const buttons = [
             { displayText: '🔥 Paling Murah', id: 'paling_murah' },
             { displayText: '⚡ Tebus Heboh', id: 'tebus_heboh' },
@@ -190,33 +180,26 @@ const startBot = async () => {
         await sock.sendPresenceUpdate('paused', jid);
     };
 
-    // ==================== HANDLE PILIHAN KATEGORI ====================
     const handleCategorySelection = async (sock, jid, categoryId) => {
-        const categoryKey = categoryId;
-        const folderPath = config.imagePaths[categoryKey];
-        
+        const folderPath = config.imagePaths[categoryId];
         if (!folderPath) {
             await sock.sendMessage(jid, { text: '❌ Kategori tidak valid.' });
             return;
         }
 
-        // Typing
         await sock.sendPresenceUpdate('composing', jid);
         await sleep(randomDelay(1500, 2500));
         
-        // Cari gambar random
         const imagePath = getRandomImageFromFolder(folderPath);
         if (!imagePath) {
-            await sock.sendMessage(jid, { text: `⚠️ Maaf, gambar untuk kategori ${categoryKey.replace(/_/g, ' ')} belum tersedia.` });
+            await sock.sendMessage(jid, { text: `⚠️ Maaf, gambar untuk kategori ${categoryId.replace(/_/g, ' ')} belum tersedia.` });
             await sock.sendPresenceUpdate('paused', jid);
-            // Tanya lagi
             await sleep(1000);
             await askForMore(sock, jid);
             return;
         }
 
-        // Kirim gambar dengan caption
-        const caption = config.imageCaption[categoryKey] || 'Promo spesial!';
+        const caption = config.imageCaption[categoryId] || 'Promo spesial!';
         const imageBuffer = await fs.readFile(imagePath);
         
         await sock.sendMessage(jid, {
@@ -226,31 +209,23 @@ const startBot = async () => {
         });
         
         await sock.sendPresenceUpdate('paused', jid);
-        
-        // Delay sebentar lalu tanya lagi
         await sleep(2000);
         await askForMore(sock, jid);
     };
 
-    // ==================== TANYA LAGI SETELAH KIRIM GAMBAR ====================
     const askForMore = async (sock, jid) => {
-        // Kirim pesan teks tanya dulu
         await sock.sendPresenceUpdate('composing', jid);
         await sleep(1500);
         await sock.sendMessage(jid, { text: config.askAgainText });
         await sock.sendPresenceUpdate('paused', jid);
-        
-        // Kirim ulang menu tombol
         await sleep(1000);
         await sendMainMenu(sock, jid);
     };
 
-    // ==================== CLEANUP ====================
     rl.on('close', () => {
         console.log('Bot dimatikan.');
         process.exit(0);
     });
 };
 
-// Jalankan bot
 startBot().catch(err => console.error('Error:', err));
